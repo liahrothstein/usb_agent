@@ -1,0 +1,57 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# === Runtime artifacts ===
+agent.log
+*.log
+chrome_profile/
+chrome_profile_*/
+PID
+
+# === Secrets ===
+# config.json содержит ключ Gemini после редактирования — не коммитить.
+# Шаблон лежит в config.example.json (он отслеживается).
+config.json
+config.local.json
+*.secret.json
+
+# === Heavy binaries — пользователь качает отдельно ===
+# llama-server из релизов llama.cpp + GGUF-модель с HuggingFace.
+# Папка llama/ — вся раздача llama.cpp (llama-server.exe + .dll файлы).
+llama/
+llama-server
+llama-server.exe
+llama-server-*
+*.gguf
+models/*.gguf
+
+# Архивы с бинарниками/моделями, если распаковываешь прямо в папку
+*.zip
+*.7z
+*.tar.gz
+*.tar.xz
+
+# === OS junk ===
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# === Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+test.html
