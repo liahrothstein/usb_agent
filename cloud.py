@@ -27,7 +27,8 @@ class GeminiClient:
         self.use_search = use_search
         self.timeout = timeout
 
-    def ask(self, prompt: str, system: Optional[str] = None) -> dict:
+    def ask(self, prompt: str, system: Optional[str] = None,
+            temperature: Optional[float] = None) -> dict:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.model}:generateContent?key={self.api_key}"
@@ -37,6 +38,10 @@ class GeminiClient:
         }
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
+        # temperature для self-consistency (несколько выборок + голосование).
+        # None = серверный дефолт Gemini.
+        if temperature is not None:
+            body["generationConfig"] = {"temperature": temperature}
         # Инструмент поиска. Для 1.5-семьи другой ключ.
         if self.use_search:
             if self.model.startswith("gemini-1.5"):

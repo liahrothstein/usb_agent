@@ -30,7 +30,8 @@ class OpenRouterClient:
         self.timeout = timeout
         self.max_tokens = max_tokens
 
-    def ask(self, prompt: str, system: Optional[str] = None) -> dict:
+    def ask(self, prompt: str, system: Optional[str] = None,
+            temperature: Optional[float] = None) -> dict:
         url = "https://openrouter.ai/api/v1/chat/completions"
         messages = []
         if system:
@@ -40,12 +41,20 @@ class OpenRouterClient:
         body = {
             "model": self.model,
             "messages": messages,
+            # max_tokens обязателен для cloud_first: при 20+ вопросах
+            # ответ с hints может быть 2000+ токенов. Без этого поля
+            # OpenRouter режет на ~1024, JSON обрывается, часть hints теряется.
             "max_tokens": self.max_tokens,
             # Отключаем chain-of-thought для reasoning-моделей (nemotron, deepseek-r1).
             # Без этого модель тратит все токены на рассуждения и не доходит до JSON.
             # Для не-reasoning моделей параметр игнорируется OpenRouter.
             "reasoning": {"enabled": False},
         }
+        # temperature включает случайность для self-consistency (несколько
+        # выборок + голосование). None = серверный дефолт модели (обычно 1.0).
+        # 0.6–0.8 — разумный диапазон: ответы расходятся, но не рандомильно.
+        if temperature is not None:
+            body["temperature"] = temperature
         # Веб-поиск через плагин (эквивалент суффикса :online в имени модели).
         # OpenRouter выполняет поиск и добавляет результаты в контекст модели.
         if self.use_search:

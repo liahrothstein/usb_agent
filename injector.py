@@ -20,10 +20,12 @@ VALID_ACTIONS = {
     "background_tint",
     "font_weight",
     "inject_html",
+    "placeholder_hint",
 }
 
 
 def apply_hints(cdp, hints: List[Dict]) -> int:
+    """Применяет каждую подсказку. Возвращает число успешных применений."""
     if not hints:
         return 0
     applied = 0
@@ -37,8 +39,17 @@ def apply_hints(cdp, hints: List[Dict]) -> int:
         params = h.get("params", {}) or {}
         if action not in VALID_ACTIONS:
             continue
-        if not selector and not find_text:
+        # Текстовый вопрос: нет selector/find_text, только question_index +
+        # action=placeholder_hint + params.value (ответ → placeholder поля).
+        is_text_hint = (action == "placeholder_hint" and question_index is not None
+                        and bool(params.get("value", "")))
+        if not selector and not find_text and not is_text_hint:
             continue
+        # Дедупликация по find_text УБРАНА: одинаковый текст в разных вопросах
+        # (напр. "4" в Q3 и Q15) — это разные hints. Поиск идёт по dataset-
+        # маркерам (data-usb-q-index + data-usb-option), поэтому короткий
+        # find_text подсвечивается именно в своём вопросе, а не в первом
+        # попавшемся. Уже подсвеченные элементы пропускаются через usbTinted.
         if find_text and len(find_text.strip()) <= 2 and not find_text.strip().isalpha():
             _log.warning("  ВНИМАНИЕ: короткий find_text=%r — может совпасть с чужим элементом",
                          find_text)
@@ -47,7 +58,12 @@ def apply_hints(cdp, hints: List[Dict]) -> int:
             _log.info("  пропуск: action=%s params=%r (не построен)", action, params)
             continue
         ok = cdp.inject_script(script)
-        desc = f"find_text={find_text!r}"
+        if is_text_hint:
+            desc = f"placeholder={params.get('value','')!r}"
+        elif find_text:
+            desc = f"find_text={find_text!r}"
+        else:
+            desc = f"selector={selector}"
         if question_index:
             desc += f" Q{question_index}"
         status = "OK" if ok else "НЕ найден/не применён"
@@ -68,21 +84,44 @@ def _build_script(selector: str, action: str, params: Dict,
     if not body:
         return ""
 
-    # Приоритет 1: поиск по dataset input'а/img + динамическое нахождение обёртки
+    # Текстовые вопросы (input[text]/textarea): ответ → placeholder поля.
+    # Элемент находится по data-usb-q-index + data-usb-text-input (без find_text,
+    # без selector). body (из _action_body placeholder_hint) ставит placeholder.
+    if question_index and action == "placeholder_hint":
+        return (
+            "(() => {\n"
+            f"  const qIndex = {int(question_index)};\n"
+            "  const marked = document.querySelectorAll('[data-usb-q-index]');\n"
+            "  for (const el of marked) {\n"
+            "    if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
+            "    if (el.dataset.usbTextInput !== '1') continue;\n"
+            "    if (el.dataset.usbTinted === '1') return false;\n"
+            "    try {\n"
+            f"      {body}\n"
+            "      el.dataset.usbTinted = '1';\n"
+            "      return true;\n"
+            "    } catch (e) { return false; }\n"
+            "  }\n"
+            "  return false;\n"
+            "})()"
+        )
+
+    # Приоритет 1: поиск по dataset-маркерам, проставленным get_test_structure.
+    # Универсально — не зависит ни от порядка групп, ни от HTML-структуры:
+    # input ИЛИ img с data-usb-q-index=qIndex И data-usb-option=normFind.
     if find_text and question_index:
         return (
             "(() => {\n"
             f"  const findText = {_js_str(find_text)};\n"
             f"  const qIndex = {int(question_index)};\n"
             "  const normFind = findText.replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();\n"
-            "  // Шаг 1: найти input ИЛИ img с data-usb-q-index=qIndex И data-usb-option=normFind\n"
             "  const allMarked = document.querySelectorAll('[data-usb-q-index]');\n"
             "  let targetEl = null;\n"
             "  for (const el of allMarked) {\n"
             "    if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
             "    if (el.dataset.usbOption === normFind) { targetEl = el; break; }\n"
             "  }\n"
-            "  // Fallback: частичное совпадение\n"
+            "  // Fallback: частичное совпадение (модель вернула с опечаткой/обрезкой)\n"
             "  if (!targetEl) {\n"
             "    for (const el of allMarked) {\n"
             "      if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
@@ -93,13 +132,12 @@ def _build_script(selector: str, action: str, params: Dict,
             "    }\n"
             "  }\n"
             "  if (!targetEl) return false;\n"
-            "  // Шаг 2: найти обёртку\n"
+            "  // Обёртка: label, либо ближайший предок без других input'ов.\n"
+            "  // Если target — img, обёртка = label или родитель.\n"
             "  let wrap = null;\n"
             "  if (targetEl.tagName === 'IMG') {\n"
-            "    // Если target — img, обёртка = ближайший label или родитель\n"
             "    wrap = targetEl.closest('label') || targetEl.parentElement;\n"
             "  } else {\n"
-            "    // Для input — ищем label или предка без других input'ов\n"
             "    wrap = targetEl.closest('label');\n"
             "    if (!wrap) {\n"
             "      wrap = targetEl.parentElement;\n"
@@ -110,7 +148,7 @@ def _build_script(selector: str, action: str, params: Dict,
             "        if (wrap && wrap.tagName === 'BODY') { wrap = targetEl.parentElement; break; }\n"
             "      }\n"
             "    }\n"
-            "    // Если обёртка не содержит img — но внутри есть img с этим alt, подсветим img\n"
+            "    // Если обёртка не содержит img с маркером, но внутри есть img с тем же alt — подсветим img\n"
             "    if (wrap && !wrap.querySelector('img[data-usb-option]')) {\n"
             "      const img = wrap.querySelector('img[alt]');\n"
             "      if (img) {\n"
@@ -121,34 +159,34 @@ def _build_script(selector: str, action: str, params: Dict,
             "  }\n"
             "  if (!wrap) wrap = targetEl;\n"
             "  if (wrap.dataset.usbTinted === '1') return false;\n"
+            "  const el = wrap;\n"
             "  try {\n"
-            f"    {body.replace('el.', 'wrap.')}\n"
+            f"    {body}\n"
             "    wrap.dataset.usbTinted = '1';\n"
             "    return true;\n"
             "  } catch (e) { return false; }\n"
             "})()"
         )
 
-    # Fallback: глобальный поиск
+    # Fallback: глобальный поиск — сначала img[alt], потом по textContent.
     if find_text:
         return (
             "(() => {\n"
             f"  const findText = {_js_str(find_text)};\n"
             "  const normFind = findText.replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();\n"
-            "  // Сначала img с alt\n"
             "  const imgs = document.querySelectorAll('img[alt]');\n"
             "  for (const img of imgs) {\n"
             "    if (img.dataset.usbTinted === '1') continue;\n"
             "    const alt = img.alt.replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();\n"
             "    if (alt === normFind) {\n"
+            "      const el = img;\n"
             "      try {\n"
-            f"        {body.replace('el.', 'img.')}\n"
+            f"        {body}\n"
             "        img.dataset.usbTinted = '1';\n"
             "        return true;\n"
             "      } catch (e) { return false; }\n"
             "    }\n"
             "  }\n"
-            "  // Затем по textContent\n"
             "  const els = document.querySelectorAll('label,span,td,li,p,a,option,strong,em,code,pre,h1,h2,h3,h4');\n"
             "  for (const el of els) {\n"
             "    if (el.dataset.usbTinted === '1') continue;\n"
@@ -173,9 +211,12 @@ def _build_script(selector: str, action: str, params: Dict,
         "  try {\n"
         f"    {body}\n"
         "    return true;\n"
-        "  } catch (e) { return false; }\n"
+        "  } catch (e) {\n"
+        "    return false;\n"
+        "  }\n"
         "})()"
     )
+
 
 def _action_body(action: str, params: Dict) -> str:
     if action == "italic_letter":
@@ -226,5 +267,18 @@ def _action_body(action: str, params: Dict) -> str:
     if action == "inject_html":
         html = params.get("html", "<span style='color:#888;font-weight:600;font-size:1.1em'>!</span>")
         return f"el.insertAdjacentHTML('beforeend', {_js_str(html)});"
+
+    if action == "placeholder_hint":
+        val = params.get("value", "")
+        if not val:
+            return ""
+        val_js = _js_str(str(val))
+        # Если у поля уже есть placeholder — дописываем ответ через "→",
+        # иначе ставим ответ как placeholder. value поля НЕ трогаем —
+        # это подсказка, а не готовый ответ (placeholder виден, пока поле пусто).
+        return (
+            "const cur = el.getAttribute('placeholder') || '';\n"
+            "el.setAttribute('placeholder', cur ? (cur + ' → ' + " + val_js + ") : " + val_js + ");"
+        )
 
     return ""
