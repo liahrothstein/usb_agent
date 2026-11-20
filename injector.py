@@ -50,9 +50,12 @@ def apply_hints(cdp, hints: List[Dict]) -> int:
         # маркерам (data-usb-q-index + data-usb-option), поэтому короткий
         # find_text подсвечивается именно в своём вопросе, а не в первом
         # попавшемся. Уже подсвеченные элементы пропускаются через usbTinted.
+        # Короткий find_text: scope-match по data-usb-q-index уже гарантирует
+        # подсветку в СВОЁМ вопросе (не в чужом). Fallback includes для ≤ 2
+        # символов отключён ниже — короткий '4' не подтянет 'Math::Pow(4)'.
         if find_text and len(find_text.strip()) <= 2 and not find_text.strip().isalpha():
-            _log.warning("  ВНИМАНИЕ: короткий find_text=%r — может совпасть с чужим элементом",
-                         find_text)
+            _log.info("  короткий find_text=%r — match строго по точному совпадению внутри вопроса",
+                      find_text)
         script = _build_script(selector, action, params, find_text, question_index)
         if not script:
             _log.info("  пропуск: action=%s params=%r (не построен)", action, params)
@@ -121,8 +124,11 @@ def _build_script(selector: str, action: str, params: Dict,
             "    if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
             "    if (el.dataset.usbOption === normFind) { targetEl = el; break; }\n"
             "  }\n"
-            "  // Fallback: частичное совпадение (модель вернула с опечаткой/обрезкой)\n"
-            "  if (!targetEl) {\n"
+          "  // Fallback: частичное совпадение (модель вернула с опечаткой/обрезкой).\n"
+          "  // Для короткого find_text (≤ 2 символов) — ТОЛЬКО точное совпадение\n"
+          "  // выше: иначе '4' ложно подтянет опцию 'Math::Pow(4)' того же вопроса\n"
+          "  // (scope по qIndex соблюдён, но подсветится не та опция).\n"
+          "  if (!targetEl && normFind.length > 2) {\n"
             "    for (const el of allMarked) {\n"
             "      if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
             "      const opt = el.dataset.usbOption || '';\n"
