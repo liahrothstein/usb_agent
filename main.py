@@ -137,8 +137,8 @@ def _recover_hints(text: str) -> dict:
 
     Балансирует фигурные скобки (с учётом строк и вложенного params),
     парсит каждый объект отдельно — один битой объект не губит остальные.
-    Поддерживает оба формата: background_tint (find_text) и placeholder_hint
-    (params.value, без find_text), любой порядок ключей.
+    Поддерживает оба формата: background_tint (target_index) и placeholder_hint
+    (params.value, без target_index), любой порядок ключей.
     """
     hints = []
     arr_start = text.find("[")
@@ -192,6 +192,8 @@ def _recover_hints(text: str) -> dict:
         if isinstance(obj, dict) and "action" in obj:
             if "find_text" not in obj:
                 obj["find_text"] = ""
+            if "target_index" not in obj:
+                obj["target_index"] = None
             hints.append(obj)
         i = j + 1
     if hints:
@@ -202,8 +204,8 @@ def _recover_hints(text: str) -> dict:
 def _is_meaningful_answer(val: str) -> bool:
     """True, если value — реальный ответ, а не заглушка модели.
 
-    Ловит не только голое '...', но и заглушки с буквами: 'd = Math::...',
-    'z = ...', 'Math::...' (модель оставила дыру), и явные отказы
+    Ловит не только голое '...', но и заглушки с буквами: 'выражение = ...',
+    'вызов(...)' (модель оставила дыру), и явные отказы
     'Нет данных' / 'не знаю'. Такие hint'ы дропаются → вопрос уходит во 2-й
     проход; если модель и там не сможет — поле остаётся пустым (честный
     пропуск лучше мусора в placeholder).
@@ -213,7 +215,7 @@ def _is_meaningful_answer(val: str) -> bool:
     s = val.strip()
     if not s:
         return False
-    # Подстрока-дыра внутри value: '...', '…' (d = Math::..., z = ..., f(...)  )
+    # Подстрока-дыра внутри value: '...', '…' (присваивание с дырой, вызов с дырой)
     if "..." in s or "…" in s:
         return False
     low = s.lower()
@@ -233,37 +235,41 @@ def _is_meaningful_answer(val: str) -> bool:
 
 
 def _ensure_statement_terminator(val: str) -> str:
-    """Добавляет ';' к value, если это оператор C++/CLI, а не значение.
+    """Добавляет ';' к value, если это похоже на оператор/выражение
+    C-подобного языка, а не на значение.
 
-    Модель часто теряет ';' на операторах (Console::WriteLine(...), z=...,
-    k=...::Parse(...)), а без неё оператор не скомпилируется. Значения (const,
-    3, 6_7_3, Math::E) — не операторы, их не трогаем.
+    Модель часто теряет ';' на операторах (присваивание, вызов функции),
+    а без неё оператор не скомпилируется. Значения (константы, числа,
+    идентификаторы) — не операторы, их не трогаем. Универсально: не зависит
+    от конкретного языка теста.
     """
     if not val:
         return val
     v = val.strip()
     if not v or v[-1] in (';', '}', '{'):
         return v
-    # Признаки оператора: присваивание (=), вызов Console::, преобразование Parse
-    looks_stmt = ('=' in v
-                  or v.startswith('Console::')
-                  or '::Parse(' in v)
+    # Признаки оператора C-подобного языка: присваивание (=) или вызов
+    # функции (заканчивается на ')'). Значения/константы их не имеют.
+    looks_stmt = ('=' in v) or v.endswith(')')
     if looks_stmt:
         return v + ';'
     return v
 
 
 def deduplicate_hints(hints: list, test_structure_json: str) -> list:
-    """Группирует hints по question_index, валидирует find_text против options,
-    ограничивает radio=1, checkbox<=2 (или 3), text=1.
+    """Группирует hints по question_index, валидирует target_index против
+    options вопроса, ограничивает radio=1, checkbox<=2 (или 3), text=1.
 
     - question_index из test_structure (1-based, в DOM-порядке).
-    - find_text должен быть в options вопроса; если нет — перемещается в вопрос,
-      где он есть (модель иногда путает похожие вопросы).
+    - radio/checkbox: hint = action=background_tint + target_index (index
+      варианта из options вопроса). target_index проверяется по диапазону
+      [0, len(options)); миграции НЕТ — индекс имеет смысл только в своём
+      вопросе, спутать с другим вопросом невозможно.
     - Текстовые вопросы (type=text): hint = action=placeholder_hint +
-      params.value, без find_text. question_index обязателен; поле должно быть
-      type=text, иначе перемещается на ближайший text-вопрос.
-    - Нормализация: NBSP→пробел, Math::PI→π, ·/∙/×→*, пробелы схлопываются.
+      params.value, без target_index. question_index обязателен.
+    - Нормализация текста варианта (для конвертации placeholder→tint и
+      восстановления find_text→target_index): NBSP→пробел, ·/∙/×→*,
+      пробелы схлопываются.
     """
     if not hints:
         return hints
@@ -276,13 +282,16 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
         questions = []
 
     if not questions:
-        # Нет структуры — только дедупликация по find_text
+        # Нет структуры — только дедупликация по (question_index, target_index)
         seen = set()
         result = []
         for h in hints:
+            qi = h.get("question_index")
+            ti = h.get("target_index")
             ft = h.get("find_text", "")
-            if ft and ft not in seen:
-                seen.add(ft)
+            key = (qi, ti, ft)
+            if key not in seen:
+                seen.add(key)
                 result.append(h)
         return result
 
@@ -295,19 +304,21 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
                           q_idx_show + 1,
                           q_show.get("type"),
                           q_show.get("question_text", "")[:120],
-                          q_show.get("options", [])[:3])
+                          [o.get("text") for o in q_show.get("options", [])][:3])
         deduplicate_hints._logged_structure = True
 
     def _norm(s):
         s = (s or '').replace('\u00a0', ' ')
-        # Модель часто пишет Math::PI вместо π; разные символы умножения → *
-        s = re.sub(r'Math::PI', 'π', s, flags=re.IGNORECASE)
-        s = re.sub(r'\bpi\b', 'π', s, flags=re.IGNORECASE)
+        # Разные символы умножения → * (для fuzzy-сравнения вариантов)
         s = s.replace('·', '*').replace('∙', '*').replace('×', '*')
         return re.sub(r'\s+', ' ', s).strip()
 
+    # options_norm: нормализованные тексты; options_by_norm: norm(text)→index
     for q in questions:
-        q["options_norm"] = [_norm(o) for o in q.get("options", [])]
+        opts = q.get("options", []) or []
+        q["options_norm"] = [_norm(o.get("text", "")) for o in opts]
+        q["options_by_norm"] = {_norm(o.get("text", "")): o.get("index")
+                                for o in opts}
 
     # question_index вне диапазона 1..N — отбрасываем (защита от галлюцинаций)
     n_questions = len(questions)
@@ -315,7 +326,7 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
     rejected = 0
     for h in hints:
         qi = h.get("question_index")
-        if qi is not None and (qi < 1 or qi > n_questions):
+        if qi is not None and (not isinstance(qi, int) or qi < 1 or qi > n_questions):
             rejected += 1
             continue
         valid_hints.append(h)
@@ -328,83 +339,96 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
     unmatched = []
     for h in hints:
         qi = h.get("question_index")
+        action = h.get("action", "")
+        params = h.get("params", {}) or {}
+        value = params.get("value", "")
+        ti = h.get("target_index")
         ft = _norm(h.get("find_text", ""))
-        # Текстовый вопрос: action=placeholder_hint + params.value, без find_text.
-        is_text_hint = (h.get("action") == "placeholder_hint"
-                        and bool(h.get("params", {}).get("value", ""))
-                        and not ft)
-        if not ft and not is_text_hint:
-            continue
+
+        is_text_hint = (action == "placeholder_hint" and bool(value) and ti is None)
+        is_tint_hint = (action == "background_tint" and qi is not None)
+
         if is_text_hint:
-            # Заглушки ('...', '???', пусто) — не ответы: дропаем, вопрос
-            # останется пропущенным (честнее, чем выводить '...' в placeholder).
-            if not _is_meaningful_answer(h.get("params", {}).get("value", "")):
-                _log.info("  Q%s: text-hint пропущен — value=%r (заглушка)",
-                          qi, h.get("params", {}).get("value", ""))
+            # Заглушки ('...', '???', пусто) — не ответы: дропаем.
+            if not _is_meaningful_answer(value):
+                _log.info("  Q%s: text-hint пропущен — value=%r (заглушка)", qi, value)
                 continue
-            # question_index обязателен — без него поле не найти
             if qi is None:
                 unmatched.append(h)
                 continue
-            # Поле должно быть type=text. Но модель часто путает формат и
-            # возвращает placeholder_hint (value = правильный вариант) для
-            # radio/checkbox. Если value совпадает с вариантом — конвертируем
-            # в background_tint и применяем к этому вопросу (а не мигрируем на
-            # Q1, теряя ответ). Иначе — мигрируем на ближайший text-вопрос.
             q = questions[qi - 1] if 1 <= qi <= n_questions else None
-            if q and q.get("type") != "text":
-                val = h.get("params", {}).get("value", "")
-                val_norm = _norm(val)
-                if val_norm and val_norm in q.get("options_norm", []):
-                    raw_opt = next((o for o in q.get("options", [])
-                                    if _norm(o) == val_norm), val)
-                    h["action"] = "background_tint"
-                    h["find_text"] = raw_opt
-                    h["params"] = {}
-                    ft = val_norm
-                    _log.info("  Конвертирован placeholder→tint Q%d: %s",
-                              qi, val_norm[:60])
-                    # падаем в путь find_text ниже (без continue)
-                else:
-                    text_qi = next((i for i, qq in enumerate(questions, 1)
-                                    if qq.get("type") == "text"), None)
-                    if text_qi:
-                        _log.info("  Перемещён text-hint Q%d→Q%d", qi, text_qi)
-                        qi = text_qi
-                        h["question_index"] = qi
-                        question_hints.setdefault(qi, []).append(h)
-                    else:
-                        unmatched.append(h)
-                    continue
-            else:
+            if q and q.get("type") == "text":
                 h["question_index"] = qi
                 question_hints.setdefault(qi, []).append(h)
                 continue
-        if qi is None:
-            # Fallback: найти вопрос, где find_text есть в options
-            for idx, q in enumerate(questions, 1):
-                if ft in q.get("options_norm", []):
-                    qi = idx
-                    break
-        if qi is not None:
-            # Валидация: find_text должен быть в options этого вопроса.
-            # Если нет — переместить в вопрос, где он есть.
-            q = questions[qi - 1] if 1 <= qi <= n_questions else None
-            if q and ft not in q.get("options_norm", []):
-                found_qi = None
-                for other_qi, other_q in enumerate(questions, 1):
-                    if other_qi == qi:
-                        continue
-                    if ft in other_q.get("options_norm", []):
-                        found_qi = other_qi
-                        break
-                if found_qi:
-                    _log.info("  Перемещён hint Q%d→Q%d: %s", qi, found_qi, ft[:60])
-                    qi = found_qi
-            h["question_index"] = qi
-            question_hints.setdefault(qi, []).append(h)
-        else:
+            # Модель вернула placeholder_hint (формат текста) для radio/checkbox,
+            # но value — правильный вариант. Конвертируем в background_tint +
+            # target_index (index варианта, чей текст = value).
+            if q:
+                val_norm = _norm(value)
+                idx = (q.get("options_by_norm", {}) or {}).get(val_norm)
+                if idx is not None:
+                    h["action"] = "background_tint"
+                    h["target_index"] = idx
+                    h["find_text"] = ""
+                    h["params"] = {}
+                    question_hints.setdefault(qi, []).append(h)
+                    _log.info("  Конвертирован placeholder→tint Q%d: index=%s",
+                              qi, idx)
+                    continue
+                # value не сопоставлен с вариантом — мигрируем на ближайший
+                # text-вопрос (текстовый ответ переносится; индекс — нет).
+                text_qi = next((i for i, qq in enumerate(questions, 1)
+                                if qq.get("type") == "text"), None)
+                if text_qi:
+                    _log.info("  Перемещён text-hint Q%d→Q%d", qi, text_qi)
+                    h["question_index"] = text_qi
+                    question_hints.setdefault(text_qi, []).append(h)
+                else:
+                    unmatched.append(h)
+                continue
             unmatched.append(h)
+            continue
+
+        if is_tint_hint:
+            q = questions[qi - 1] if 1 <= qi <= n_questions else None
+            if not q:
+                unmatched.append(h)
+                continue
+            opts = q.get("options", []) or []
+            n_opts = len(opts)
+            # target_index задан — проверяем диапазон. Миграции НЕТ.
+            if ti is not None:
+                if (not isinstance(ti, int)) or ti < 0 or ti >= n_opts:
+                    _log.info("  Q%d: target_index=%s вне диапазона [0,%d) — дроп",
+                              qi, ti, n_opts)
+                    continue
+                h["target_index"] = ti
+                question_hints.setdefault(qi, []).append(h)
+                continue
+            # target_index не задан, но есть find_text — восстановление:
+            # вариант с совпадающим текстом → его index.
+            if ft:
+                idx = (q.get("options_by_norm", {}) or {}).get(ft)
+                if idx is None:
+                    # частичное совпадение (модель сократила/опечатка)
+                    for o in opts:
+                        ot = _norm(o.get("text", ""))
+                        if ot and (ot == ft or (len(ft) > 2 and len(ot) < 500
+                                   and (ot.find(ft) != -1 or ft.find(ot) != -1))):
+                            idx = o.get("index")
+                            break
+                if idx is not None:
+                    h["target_index"] = idx
+                    h["find_text"] = ""
+                    question_hints.setdefault(qi, []).append(h)
+                    continue
+            _log.info("  Q%d: tint-hint без target_index/find_text — дроп", qi)
+            continue
+
+        # Ни text, ни tint (странный формат или локальный UX-hint с find_text
+        # без question_index) — пропускаем как есть в unmatched.
+        unmatched.append(h)
 
     # radio → 1, checkbox → ≤2 (если выбраны почти все) или ≤3, text → 1
     result = []
@@ -412,7 +436,22 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
         q_idx = qi - 1 if qi else -1
         q = questions[q_idx] if 0 <= q_idx < n_questions else {}
         qtype = q.get("type", "")
-        q_options = q.get("options_norm", [])
+        q_options = q.get("options", []) or []
+        # Дедупликация внутри вопроса по target_index (до cap) — checkbox
+        # может выдать дубли одного варианта после голосования.
+        seen_ti = set()
+        deduped = []
+        for h in q_hints:
+            ti = h.get("target_index")
+            if ti is not None:
+                if ti in seen_ti:
+                    continue
+                seen_ti.add(ti)
+            deduped.append(h)
+        if len(deduped) < len(q_hints):
+            _log.info("  Q%d: дедуп по target_index %d→%d",
+                      qi, len(q_hints), len(deduped))
+        q_hints = deduped
         if qtype == "text" and len(q_hints) > 1:
             _log.info("  text Q%d: оставлен 1 из %d hints", qi, len(q_hints))
             q_hints = q_hints[:1]
@@ -430,8 +469,8 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
         result.extend(q_hints)
 
     result.extend(unmatched)
-    # Гарантируем ';' на операторах C++/CLI — модель часто его теряет, а без
-    # неё оператор не скомпилируется. Значения (const, 3, Math::E) не трогаем.
+    # Гарантируем ';' на операторах C-подобных языков — модель часто его
+    # теряет, а без неё оператор не скомпилируется. Значения/константы не трогаем.
     for h in result:
         if h.get("action") == "placeholder_hint" and h.get("params", {}).get("value"):
             h["params"]["value"] = _ensure_statement_terminator(h["params"]["value"])
@@ -441,8 +480,8 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
 def aggregate_hints_by_voting(samples, test_structure_json):
     """Self-consistency: из N выборок облака выбираем наиболее частый
     ответ на каждый вопрос. Усредняет случайность модели на нестабильных
-    вопросах (например Q50 на разных прогонах давала «Console::WriteLine(...)»,
-    «0», «Время истекло» — голосование берёт большинство).
+    вопросах (на разных прогонах один и тот же вопрос может давать разные
+    ответы — голосование берёт большинство).
 
     samples: список списков hints (по одному на выборку).
     Возвращает единый список hints-победителей голосования.
@@ -457,30 +496,26 @@ def aggregate_hints_by_voting(samples, test_structure_json):
         pass
 
     def _vkey(s):
-        # нормализация ключа голоса: схлопываем пробелы + lower, чтобы
-        # «2, 3» и «2,3» совпадали. Содержательно разные записи формул
-        # (Math::Log(z)/Log(2) vs Math::Log(z,2)) останутся разными ключами —
-        # для голосования важна частота одинаковых ответов, не семантика.
+        # нормализация ключа голоса для text-value: схлопываем пробелы + lower,
+        # чтобы «2, 3» и «2,3» совпадали. Для radio/checkbox нормализация не
+        # нужна — голосуем по целочисленному target_index.
         return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
-    def _answer_of(h):
-        # «ответ» hint'а из ЛЮБОГО формата: find_text (background_tint) ИЛИ
-        # params.value (placeholder_hint, либо background_tint с value в
-        # params — модель иногда отдаёт radio именно так). Без этого
-        # background_tint без find_text терялся и radio-вопрос выпадал.
-        ft = h.get("find_text") or ""
-        if ft:
-            return ft
+    def _vote_key(h):
+        # Ключ голоса: radio/checkbox → ("i", target_index) — int, без
+        # нормализации (индекс однозначен). text → ("t", norm(value)).
+        # Разные форматы — разные префиксы, чтобы text-value не смешивалось
+        # с индексом. Без target_index/value — None (вопрос идёт в fallback).
+        ti = h.get("target_index")
+        if ti is not None and h.get("action") == "background_tint":
+            try:
+                return ("i", int(ti))
+            except (TypeError, ValueError):
+                return None
         v = (h.get("params") or {}).get("value") or ""
         if v:
-            return v
-        return ""
-
-    def _hint_key(h):
-        a = _answer_of(h)
-        if not a:
-            return None
-        return ("a", _vkey(a))
+            return ("t", _vkey(v))
+        return None
 
     # qi -> {key: hint} — первый hint для ключа (для реконструкции)
     by_qi_key = {}
@@ -500,9 +535,9 @@ def aggregate_hints_by_voting(samples, test_structure_json):
             if qi not in seen_set:
                 seen_set.add(qi)
                 seen_qi.append(qi)
-            k = _hint_key(h)
+            k = _vote_key(h)
             if k is None:
-                # странный формат (нет ни find_text, ни params.value) —
+                # странный формат (нет ни target_index, ни params.value) —
                 # запоминаем как fallback, чтобы вопрос не выпал целиком.
                 nokey_by_qi.setdefault(qi, h)
                 continue
@@ -601,27 +636,27 @@ def answer_unanswered_via_cloud(cloud_client, hints_applied, test_structure_json
     questions_json = json.dumps(compact, ensure_ascii=False, indent=2)
 
     system_msg = (
-        "Ты — помощник для решения тестов по C++/CLI и программированию. "
+        "Ты — помощник для решения учебных тестов и задач. "
         "Ниже вопросы, на которые ты не ответил в предыдущем запросе. "
         "Для КАЖДОГО выбери правильный ответ:\n"
         "- radio: РОВНО ОДИН наиболее вероятный вариант\n"
         "- checkbox: ТОЛЬКО правильные варианты (если не уверен — 1-2 наиболее "
         "вероятных, НИКОГДА не выбирай ВСЕ варианты)\n"
-        "- type=text (без вариантов): верни ОДИН hint с action=placeholder_hint и "
-        "params.value=КОНКРЕТНЫЙ ответ на этот вопрос (НЕ шаблон «z = x + y;» для "
-        "всех). Читай формулировку: вывод→Console::WriteLine(\"текст\");, "
-        "ввод→Console::ReadLine();, константа→const, очистка→Console::Clear();, "
-        "корень→Math::Sqrt(x). Операторы (Console::, z=..., ::Parse) всегда "
-        "заканчивай точкой с запятой; значения (const, число) — без неё. "
+        "- radio/checkbox: верни hint с action=background_tint и target_index = "
+        "index правильного варианта (поле index из options вопроса).\n"
+        "- type=text (options пустой): верни ОДИН hint с action=placeholder_hint и "
+        "params.value=КОНКРЕТНЫЙ ответ на этот вопрос (НЕ один шаблон для всех). "
+        "Отвечай на ЯЗЫКЕ теста: если вопрос про программирование — используй "
+        "синтаксис, видимый в тексте вопроса и вариантов; не выдумывай "
+        "конструкции, которых в тесте нет. Если ответ — оператор/выражение "
+        "языка, где точка с запятой обязательна (C/C++/Java/JS/C# и подобные), "
+        "ставь её; значения, константы и модификаторы — без неё. "
         "Если в вопросе нет конкретики (переменных/чисел) — "
         "поищи их в тексте страницы рядом с вопросом. Если просится общий вид — "
-        "дай шаблон («переменная = выражение;»). НЕ используй '...'/'…'/'???'/"
-        "'Math::...'/'z = ...'/'Нет данных'/пусто как value — лучше пропусти "
-        "вопрос. question_index обязателен, find_text не нужен\n"
-        "Возвращай find_text ТОЧНО как он написан в options (без нумерации, без "
-        "префиксов). Для формул копируй alt/текст дословно.\n"
-        "Формат: JSON {\"hints\": [{\"question_index\": 1, \"find_text\": \"...\", "
-        "\"action\": \"background_tint\", \"params\": {}}, "
+        "дай шаблон. НЕ используй '...'/'…'/'???'/'<ответ>'/'Нет данных'/пусто "
+        "как value — лучше пропусти вопрос. question_index обязателен.\n"
+        "Формат: JSON {\"hints\": [{\"question_index\": 1, \"action\": \"background_tint\", "
+        "\"target_index\": 0}, "
         "{\"question_index\": 7, \"action\": \"placeholder_hint\", \"params\": {\"value\": \"42\"}}]}"
     )
     user_msg = (f"Пропущенные вопросы:\n\n{questions_json}\n\n"
@@ -668,126 +703,120 @@ def answer_unanswered_via_cloud(cloud_client, hints_applied, test_structure_json
                     str(raw_text)[:200])
         return []
 
-    from difflib import SequenceMatcher
-
     def _norm(s):
         s = (s or '').replace('\u00a0', ' ')
-        s = re.sub(r'Math::PI', 'π', s, flags=re.IGNORECASE)
-        s = re.sub(r'\bpi\b', 'π', s, flags=re.IGNORECASE)
+        # Разные символы умножения → * (для сопоставления value→вариант)
         s = s.replace('·', '*').replace('∙', '*').replace('×', '*')
         return re.sub(r'\s+', ' ', s).strip()
-
-    # Агрессивная нормализация для fuzzy: без пробелов, lower
-    def _fuzzy(s):
-        s = _norm(s).lower()
-        s = re.sub(r'\s*([*/+\-=()])\s*', r'\1', s)
-        s = re.sub(r'\s+', '', s)
-        return s
 
     validated = []
     valid_indices = {q.get("question_index") for q in unanswered}
     text_qs = {q.get("question_index"): q for q in unanswered if q.get("type") == "text"}
+    q_by_qi = {q.get("question_index"): q for q in unanswered}
     for h in new_hints:
         qi = h.get("question_index")
+        action = h.get("action", "")
+        params = h.get("params", {}) or {}
+        value = params.get("value", "")
+        ti = h.get("target_index")
         ft = _norm(h.get("find_text", ""))
-        # Текстовый hint: action=placeholder_hint + params.value (без find_text)
-        is_text = (h.get("action") == "placeholder_hint"
-                   and bool(h.get("params", {}).get("value", "")))
+
+        # Текстовый hint: placeholder_hint + value.
+        is_text = (action == "placeholder_hint" and bool(value))
         if is_text:
-            val = h.get("params", {}).get("value", "")
-            if not _is_meaningful_answer(val):
+            if not _is_meaningful_answer(value):
                 log.info("  Облако-2: Q%s text-hint пропущен — value=%r (заглушка)",
-                         qi, val)
+                         qi, value)
                 continue
             if qi in text_qs:
                 validated.append({
-                    "find_text": "",
                     "question_index": qi,
                     "action": "placeholder_hint",
-                    "params": {"value": _ensure_statement_terminator(val)}
+                    "params": {"value": _ensure_statement_terminator(value)}
                 })
             else:
-                # Модель вернула placeholder_hint (формат текста) для
-                # radio/checkbox, но val — правильный вариант. Конвертируем.
-                q_match = next((q for q in unanswered
-                                if q.get("question_index") == qi), None)
-                val_norm = _norm(val)
-                opts_norm = [_norm(o) for o in (q_match or {}).get("options", [])]
-                if q_match and val_norm and val_norm in opts_norm:
-                    raw_opt = next((o for o in q_match.get("options", [])
-                                    if _norm(o) == val_norm), val)
+                # placeholder_hint для radio/checkbox — конвертируем в tint,
+                # если value совпадает с вариантом → его target_index.
+                q_match = q_by_qi.get(qi)
+                val_norm = _norm(value)
+                idx = None
+                if q_match:
+                    for o in (q_match.get("options", []) or []):
+                        if _norm(o.get("text", "")) == val_norm:
+                            idx = o.get("index")
+                            break
+                if idx is not None:
                     validated.append({
-                        "find_text": raw_opt,
                         "question_index": qi,
                         "action": "background_tint",
+                        "target_index": idx,
                         "params": {}
                     })
-                    log.info("  Облако-2: конвертирован placeholder→tint Q%d: %s",
-                             qi, val_norm[:60])
+                    log.info("  Облако-2: конвертирован placeholder→tint Q%d: index=%s",
+                             qi, idx)
                 else:
                     log.warning("  Облако-2: placeholder_hint для не-text Q%d "
-                                "(val=%r) — пропущен", qi, str(val)[:60])
+                                "(val=%r) — пропущен", qi, str(value)[:60])
             continue
-        if not ft or qi not in valid_indices:
-            if ft:
-                log.warning("  Облако-2: неизвестный question_index=%r для find_text=%r",
-                            qi, ft[:60])
-            continue
-        if len(ft) > 3 and ft[0].isdigit() and ft[1:3] in (". ", ") "):
-            ft = ft[3:].strip()
 
-        q_match = next((q for q in unanswered if q.get("question_index") == qi), None)
+        # tint hint: background_tint + target_index (или find_text для восстановления).
+        if qi not in valid_indices:
+            if ti is not None or ft:
+                log.warning("  Облако-2: неизвестный question_index=%r (ti=%r, ft=%r)",
+                            qi, ti, ft[:60])
+            continue
+        q_match = q_by_qi.get(qi)
         if not q_match:
             continue
+        opts = q_match.get("options", []) or []
+        n_opts = len(opts)
 
-        # 3 уровня: точное → fuzzy → включение
-        matched_opt = None
-        ft_fuzzy = _fuzzy(ft)
-        for opt_raw in q_match.get("options", []):
-            opt_s = _norm(opt_raw)
-            opt_fuzzy = _fuzzy(opt_raw)
-            if ft == opt_s:
-                matched_opt = opt_s
-                break
-            if ft_fuzzy and opt_fuzzy and ft_fuzzy == opt_fuzzy:
-                matched_opt = opt_s
-                break
-            if opt_fuzzy and ft_fuzzy and (opt_fuzzy.startswith(ft_fuzzy) or ft_fuzzy.startswith(opt_fuzzy)):
-                matched_opt = opt_s
-                break
-
-        # Левенштейн: самое похожее option
-        if not matched_opt and len(ft) >= 3:
+        # target_index задан — проверяем диапазон. Миграции НЕТ.
+        if ti is not None:
             try:
-                best_ratio = 0
-                best_opt = None
-                for opt_raw in q_match.get("options", []):
-                    opt_s = _norm(opt_raw)
-                    ratio = SequenceMatcher(None, _fuzzy(ft), _fuzzy(opt_raw)).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_opt = opt_s
-                if best_opt and best_ratio >= 0.75:
-                    log.info("  Облако-2: fuzzy match (ratio=%.2f) %r → %r",
-                             best_ratio, ft[:60], best_opt[:60])
-                    matched_opt = best_opt
-            except Exception:
-                pass
-
-        if matched_opt:
+                ti_i = int(ti)
+            except (TypeError, ValueError):
+                log.warning("  Облако-2: Q%d target_index=%r не int — пропущен", qi, ti)
+                continue
+            if ti_i < 0 or ti_i >= n_opts:
+                log.warning("  Облако-2: Q%d target_index=%s вне диапазона [0,%d) — пропущен",
+                            qi, ti, n_opts)
+                continue
             validated.append({
-                "find_text": matched_opt,
                 "question_index": qi,
                 "action": "background_tint",
+                "target_index": ti_i,
                 "params": {}
             })
-        else:
-            real_opts = [_norm(o) for o in q_match.get("options", [])]
-            log.warning("  Облако-2: не сопоставлено find_text=%r (Q%d)", ft[:80], qi)
-            log.warning("    Реальные options Q%d: %s", qi, real_opts)
-            log.warning("    Fuzzy find_text: %r", ft_fuzzy[:80])
-            log.warning("    Fuzzy options:   %s",
-                        [_fuzzy(o) for o in q_match.get("options", [])])
+            continue
+
+        # target_index не задан, но есть find_text — восстановление по тексту.
+        if ft:
+            idx = None
+            for o in opts:
+                if _norm(o.get("text", "")) == ft:
+                    idx = o.get("index")
+                    break
+            if idx is None:
+                # частичное совпадение (модель сократила/опечатка)
+                for o in opts:
+                    ot = _norm(o.get("text", ""))
+                    if ot and (ot == ft or (len(ft) > 2 and len(ot) < 500
+                               and (ot.find(ft) != -1 or ft.find(ot) != -1))):
+                        idx = o.get("index")
+                        break
+            if idx is not None:
+                validated.append({
+                    "question_index": qi,
+                    "action": "background_tint",
+                    "target_index": idx,
+                    "params": {}
+                })
+                continue
+            log.warning("  Облако-2: Q%d не сопоставлен find_text=%r", qi, ft[:80])
+            continue
+
+        log.warning("  Облако-2: Q%d hint без target_index/find_text — пропущен", qi)
 
     log.info("Облако 2-й проход: %d hints → %d после валидации",
              len(new_hints), len(validated))
@@ -993,8 +1022,8 @@ def main():
                     if consistency_samples > 1:
                         # Self-consistency: N выборок с температурой → голосование
                         # большинством по каждому вопросу. Усредняет случайность
-                        # модели (Q50 на разных прогонах: «Console::WriteLine(...)»,
-                        # «0», «Время истекло» — голосование берёт большинство).
+                        # модели (на разных прогонах один вопрос может давать
+                        # разные ответы — голосование берёт большинство).
                         log.info("Облако (%s): анализирую страницу ×%d (temp=%s)...",
                                  provider_name, consistency_samples, cloud_temperature)
                         samples_hints = []
@@ -1006,8 +1035,8 @@ def main():
                                 p = parse_llm_json(r["text"])
                                 raw_hints = p.get("hints", []) if p else []
                                 # Прогон через dedup ДО голосования: восстанавливает
-                                # question_index для radio/checkbox hints (по find_text
-                                # в options) — как в одинарном режиме. Без этого hints
+                                # question_index и target_index для radio/checkbox hints
+                                # — как в одинарном режиме. Без этого hints
                                 # без qi (часто у восстановленного битого JSON) теряются
                                 # при голосовании на `if qi is None: continue`, и radio
                                 # выпадают (было 20/50 вместо ~50).
@@ -1125,7 +1154,7 @@ def main():
             # Применяем инъекции (общий для обоих путей)
             hints = parsed.get("hints", []) if parsed else []
             # Post-processing: для radio-вопросов оставляем только 1 ответ
-            # (модель часто маркирует несколько), плюс дедупликация по find_text.
+            # (модель часто маркирует несколько), плюс дедупликация по target_index.
             if hints and test_structure and test_structure != "[]":
                 before = len(hints)
                 hints = deduplicate_hints(hints, test_structure)

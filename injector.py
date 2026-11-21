@@ -34,35 +34,38 @@ def apply_hints(cdp, hints: List[Dict]) -> int:
             continue
         selector = h.get("selector", "")
         find_text = h.get("find_text", "")
+        target_index = h.get("target_index")
         question_index = h.get("question_index")
         action = h.get("action", "")
         params = h.get("params", {}) or {}
         if action not in VALID_ACTIONS:
             continue
-        # Текстовый вопрос: нет selector/find_text, только question_index +
-        # action=placeholder_hint + params.value (ответ → placeholder поля).
+        # Текстовый вопрос: только question_index + action=placeholder_hint +
+        # params.value (ответ → placeholder поля).
         is_text_hint = (action == "placeholder_hint" and question_index is not None
                         and bool(params.get("value", "")))
-        if not selector and not find_text and not is_text_hint:
+        # radio/checkbox: question_index + target_index — прямой доступ к
+        # опции по data-usb-option-index внутри [data-usb-q]. Без find_text.
+        is_tint_hint = (action == "background_tint" and question_index is not None
+                        and target_index is not None)
+        if not selector and not find_text and not is_text_hint and not is_tint_hint:
             continue
-        # Дедупликация по find_text УБРАНА: одинаковый текст в разных вопросах
-        # (напр. "4" в Q3 и Q15) — это разные hints. Поиск идёт по dataset-
-        # маркерам (data-usb-q-index + data-usb-option), поэтому короткий
-        # find_text подсвечивается именно в своём вопросе, а не в первом
-        # попавшемся. Уже подсвеченные элементы пропускаются через usbTinted.
-        # Короткий find_text: scope-match по data-usb-q-index уже гарантирует
-        # подсветку в СВОЁМ вопросе (не в чужом). Fallback includes для ≤ 2
-        # символов отключён ниже — короткий '4' не подтянет 'Math::Pow(4)'.
+        # Локальный путь (UX-подсветка произвольных элементов страницы):
+        # find_text без question_index. Короткий find_text (≤ 2, не буквы) —
+        # точный match по тексту элемента (без includes-фолбэка).
         if find_text and len(find_text.strip()) <= 2 and not find_text.strip().isalpha():
-            _log.info("  короткий find_text=%r — match строго по точному совпадению внутри вопроса",
+            _log.info("  короткий find_text=%r — точный match по тексту элемента",
                       find_text)
-        script = _build_script(selector, action, params, find_text, question_index)
+        script = _build_script(selector, action, params, find_text,
+                               question_index, target_index)
         if not script:
             _log.info("  пропуск: action=%s params=%r (не построен)", action, params)
             continue
         ok = cdp.inject_script(script)
         if is_text_hint:
             desc = f"placeholder={params.get('value','')!r}"
+        elif is_tint_hint:
+            desc = f"target_index={target_index}"
         elif find_text:
             desc = f"find_text={find_text!r}"
         else:
@@ -82,7 +85,8 @@ def _js_str(s: str) -> str:
 
 
 def _build_script(selector: str, action: str, params: Dict,
-                  find_text: str = "", question_index: int = None) -> str:
+                  find_text: str = "", question_index: int = None,
+                  target_index: int = None) -> str:
     body = _action_body(action, params)
     if not body:
         return ""
@@ -109,61 +113,39 @@ def _build_script(selector: str, action: str, params: Dict,
             "})()"
         )
 
-    # Приоритет 1: поиск по dataset-маркерам, проставленным get_test_structure.
-    # Универсально — не зависит ни от порядка групп, ни от HTML-структуры:
-    # input ИЛИ img с data-usb-q-index=qIndex И data-usb-option=normFind.
-    if find_text and question_index:
+    # radio/checkbox: прямой доступ к опции по индексу внутри контейнера
+    # вопроса [data-usb-q]. Никакого текстового матчинга — индекс адресует
+    # ровно тот DOM-узел, который парсер пометил data-usb-option-index.
+    # Универсально: не зависит от текста варианта (число, формула, код).
+    if (question_index is not None and target_index is not None
+            and action == "background_tint"):
         return (
             "(() => {\n"
-            f"  const findText = {_js_str(find_text)};\n"
             f"  const qIndex = {int(question_index)};\n"
-            "  const normFind = findText.replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();\n"
-            "  const allMarked = document.querySelectorAll('[data-usb-q-index]');\n"
-            "  let targetEl = null;\n"
-            "  for (const el of allMarked) {\n"
-            "    if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
-            "    if (el.dataset.usbOption === normFind) { targetEl = el; break; }\n"
-            "  }\n"
-          "  // Fallback: частичное совпадение (модель вернула с опечаткой/обрезкой).\n"
-          "  // Для короткого find_text (≤ 2 символов) — ТОЛЬКО точное совпадение\n"
-          "  // выше: иначе '4' ложно подтянет опцию 'Math::Pow(4)' того же вопроса\n"
-          "  // (scope по qIndex соблюдён, но подсветится не та опция).\n"
-          "  if (!targetEl && normFind.length > 2) {\n"
-            "    for (const el of allMarked) {\n"
-            "      if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
-            "      const opt = el.dataset.usbOption || '';\n"
-            "      if (opt.length > 3 && (opt.includes(normFind) || normFind.includes(opt))) {\n"
-            "        targetEl = el; break;\n"
-            "      }\n"
-            "    }\n"
-            "  }\n"
-            "  if (!targetEl) return false;\n"
+            f"  const targetIdx = {int(target_index)};\n"
+            "  const qContainer = document.querySelector('[data-usb-q=\"' + qIndex + '\"]');\n"
+            "  if (!qContainer) return false;\n"
+            "  const opt = qContainer.querySelector('[data-usb-option-index=\"' + targetIdx + '\"]');\n"
+            "  if (!opt) return false;\n"
+            "  if (opt.dataset.usbTinted === '1') return false;\n"
             "  // Обёртка: label, либо ближайший предок без других input'ов.\n"
-            "  // Если target — img, обёртка = label или родитель.\n"
+            "  // Если opt — img, обёртка = label или родитель.\n"
             "  let wrap = null;\n"
-            "  if (targetEl.tagName === 'IMG') {\n"
-            "    wrap = targetEl.closest('label') || targetEl.parentElement;\n"
+            "  if (opt.tagName === 'IMG') {\n"
+            "    wrap = opt.closest('label') || opt.parentElement;\n"
             "  } else {\n"
-            "    wrap = targetEl.closest('label');\n"
+            "    wrap = opt.closest('label');\n"
             "    if (!wrap) {\n"
-            "      wrap = targetEl.parentElement;\n"
+            "      wrap = opt.parentElement;\n"
             "      while (wrap) {\n"
             "        const childInputs = wrap.querySelectorAll('input[type=radio], input[type=checkbox]');\n"
             "        if (childInputs.length <= 1) break;\n"
             "        wrap = wrap.parentElement;\n"
-            "        if (wrap && wrap.tagName === 'BODY') { wrap = targetEl.parentElement; break; }\n"
-            "      }\n"
-            "    }\n"
-            "    // Если обёртка не содержит img с маркером, но внутри есть img с тем же alt — подсветим img\n"
-            "    if (wrap && !wrap.querySelector('img[data-usb-option]')) {\n"
-            "      const img = wrap.querySelector('img[alt]');\n"
-            "      if (img) {\n"
-            "        const imgAlt = img.alt.replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();\n"
-            "        if (imgAlt === normFind) wrap = img;\n"
+            "        if (wrap && wrap.tagName === 'BODY') { wrap = opt.parentElement; break; }\n"
             "      }\n"
             "    }\n"
             "  }\n"
-            "  if (!wrap) wrap = targetEl;\n"
+            "  if (!wrap) wrap = opt;\n"
             "  if (wrap.dataset.usbTinted === '1') return false;\n"
             "  const el = wrap;\n"
             "  try {\n"

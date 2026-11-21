@@ -184,19 +184,26 @@ class CDPClient:
         title ИЛИ aria-label.
 
         Маркировка DOM (постоянные маркеры для инжектора):
-          input.dataset.usbQIndex  = номер вопроса (1-based)
-          input.dataset.usbOption  = нормализованный текст варианта
-          img.dataset.usbQIndex / .usbOption — если текст взят из alt картинки.
+          block.dataset.usbQ          = номер вопроса (1-based) — контейнер
+          input.dataset.usbQIndex     = номер вопроса (1-based)
+          input.dataset.usbOptionIndex = индекс варианта в options (0-based)
+          img.dataset.usbQIndex / .usbOptionIndex — если текст взят из alt.
           input.dataset.usbTextInput = '1' — для текстовых полей (options пустые).
 
         Возвращает JSON: [{question_index, type, question_text, options}].
+          options = [{"index": 0, "text": "..."}, ...] — индекс = позиция в
+          массиве, дублирует data-usb-option-index на DOM-элементе. Модель
+          возвращает target_index = index правильного варианта; инжектор
+          берёт элемент напрямую через [data-usb-option-index="N"] внутри
+          [data-usb-q="M"] — без текстового матчинга.
           type = 'radio' | 'checkbox' | 'text' (text — без вариантов, ответ
           ставится инжектором в placeholder через action=placeholder_hint).
         """
         js = r"""(() => {
   // Очистка старых маркеров (на случай повторного запуска на той же странице)
   document.querySelectorAll('[data-usb-q-index]').forEach(el => delete el.dataset.usbQIndex);
-  document.querySelectorAll('[data-usb-option]').forEach(el => delete el.dataset.usbOption);
+  document.querySelectorAll('[data-usb-q]').forEach(el => delete el.dataset.usbQ);
+  document.querySelectorAll('[data-usb-option-index]').forEach(el => delete el.dataset.usbOptionIndex);
   document.querySelectorAll('[data-usb-text-input]').forEach(el => delete el.dataset.usbTextInput);
 
   const results = [];
@@ -420,6 +427,10 @@ class CDPClient:
     const block = unit.block;
     const inputs = unit.inputs;
     const type = unit.qtype;
+    // Реальный DOM-scope: помечаем КОНТЕЙНЕР вопроса (блок с опциями).
+    // apply_hint находит опцию по индексу внутри [data-usb-q="qIndex"] —
+    // прямой доступ через data-usb-option-index, без текстового матчинга.
+    block.dataset.usbQ = String(qIndex);
     const qText = findQuestionText(block);
 
     if (type === 'text') {
@@ -431,22 +442,27 @@ class CDPClient:
       continue;
     }
 
-    // radio/checkbox: options + МАРКИРОВКА input и img
+    // radio/checkbox: options + МАРКИРОВКА input и img.
+    // Индекс = позиция в массиве options (0-based). Проставляется на каждый
+    // input И связанный img как data-usb-option-index — apply_hint берёт
+    // элемент напрямую по индексу, без текстового матчинга.
     const options = [];
+    let optIdx = 0;
     inputs.forEach(inp => {
       const optText = extractOptionText(inp, block);
       if (optText && optText.trim()) {
         const normOpt = norm(optText);
-        options.push(normOpt);
+        const idx = optIdx++;
+        options.push({ index: idx, text: normOpt });
         inp.dataset.usbQIndex = String(qIndex);
-        inp.dataset.usbOption = normOpt;
-        // Если текст взят из alt — маркируем и саму картинку
+        inp.dataset.usbOptionIndex = String(idx);
+        // Если текст взят из alt — маркируем и саму картинку тем же индексом
         const lbl = inp.closest('label') || inp.parentElement;
         if (lbl) {
           const img = lbl.tagName === 'IMG' ? lbl : lbl.querySelector('img[alt]');
           if (img && img.alt && norm(img.alt) === normOpt) {
             img.dataset.usbQIndex = String(qIndex);
-            img.dataset.usbOption = normOpt;
+            img.dataset.usbOptionIndex = String(idx);
           }
         }
       }
