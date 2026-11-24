@@ -357,6 +357,26 @@ def _is_meaningful_answer(val: str) -> bool:
     return True
 
 
+def _is_echo_of_question(value, qtext) -> bool:
+    """True, если value — эхо текста вопроса (модель не нашла ответ и вернула
+    сам вопрос/метку). Ловит таймер-метки типа 'Оставшееся время', попавшие в
+    test_structure как text-вопрос: под forced-answer модель эхо-возвращает их.
+    Сравнение после нормализации пробелов/NBSP; для коротких меток (<=40 симв.)
+    ловит также случай, когда value — префикс вопроса или наоборот.
+    """
+    if not value or not qtext:
+        return False
+    v = re.sub(r'\s+', ' ', str(value).replace('\u00a0', ' ')).strip()
+    q = re.sub(r'\s+', ' ', str(qtext).replace('\u00a0', ' ')).strip()
+    if not v or not q:
+        return False
+    if v == q:
+        return True
+    if len(v) >= 4 and len(q) <= 40 and (q.startswith(v) or v.startswith(q)):
+        return True
+    return False
+
+
 def _ensure_statement_terminator(val: str) -> str:
     """Добавляет ';' к value, если это похоже на оператор/выражение
     C-подобного языка, а не на значение.
@@ -480,6 +500,10 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
                 unmatched.append(h)
                 continue
             q = questions[qi - 1] if 1 <= qi <= n_questions else None
+            if q and _is_echo_of_question(value, q.get("question_text", "")):
+                _log.info("  Q%s: text-hint пропущен — value эхо текста вопроса (%r)",
+                          qi, str(value)[:50])
+                continue
             if q and q.get("type") == "text":
                 h["question_index"] = qi
                 question_hints.setdefault(qi, []).append(h)
@@ -529,8 +553,12 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
                 h["target_index"] = ti
                 question_hints.setdefault(qi, []).append(h)
                 continue
-            # target_index не задан, но есть find_text — восстановление:
-            # вариант с совпадающим текстом → его index.
+            # target_index не задан — восстановление по тексту правильного
+            # варианта. Модель часто кладёт его не в find_text, а в params.value,
+            # answer, text или selected — подтягиваем как find_text.
+            if not ft:
+                ft = _norm(value or h.get("answer") or h.get("text")
+                           or h.get("selected") or "")
             if ft:
                 idx = (q.get("options_by_norm", {}) or {}).get(ft)
                 if idx is None:
@@ -546,7 +574,8 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
                     h["find_text"] = ""
                     question_hints.setdefault(qi, []).append(h)
                     continue
-            _log.info("  Q%d: tint-hint без target_index/find_text — дроп", qi)
+            _log.info("  Q%d: tint-hint без target_index/find_text — дроп (raw=%s)",
+                      qi, str(h)[:200])
             continue
 
         # Ни text, ни tint (странный формат или локальный UX-hint с find_text
@@ -747,6 +776,13 @@ def answer_unanswered_via_cloud(cloud_client, hints_applied, test_structure_json
         return []
 
     log.info("Пропущено вопросов: %d — отправляю в облако повторно", len(unanswered))
+    for q in unanswered:
+        opts_txt = "; ".join(
+            "%s:%s" % (o.get("index"), (o.get("text", "") or "")[:40])
+            for o in (q.get("options") or [])[:8])
+        log.info("  пропуск Q%s type=%s q=%r opts=[%s]",
+                 q.get("question_index"), q.get("type", ""),
+                 (q.get("question_text", "") or "")[:140], opts_txt[:240])
 
     compact = []
     for i, q in enumerate(unanswered, 1):
@@ -844,12 +880,18 @@ def answer_unanswered_via_cloud(cloud_client, hints_applied, test_structure_json
         ti = h.get("target_index")
         ft = _norm(h.get("find_text", ""))
 
-        # Текстовый hint: placeholder_hint + value.
-        is_text = (action == "placeholder_hint" and bool(value))
+        # Текстовый hint: placeholder_hint. value может быть пустым — тогда
+        # модель решила не отвечать; логируем точно, не путаем с tint-дропом.
+        is_text = (action == "placeholder_hint")
         if is_text:
             if not _is_meaningful_answer(value):
-                log.info("  Облако-2: Q%s text-hint пропущен — value=%r (заглушка)",
-                         qi, value)
+                log.warning("  Облако-2: Q%s placeholder_hint без ответа "
+                            "(value=%r) — пропущен", qi, str(value)[:60])
+                continue
+            q_echo = q_by_qi.get(qi)
+            if q_echo and _is_echo_of_question(value, q_echo.get("question_text", "")):
+                log.warning("  Облако-2: Q%s placeholder_hint — value эхо текста "
+                            "вопроса (%r) — пропущен", qi, str(value)[:60])
                 continue
             if qi in text_qs:
                 validated.append({
@@ -913,7 +955,12 @@ def answer_unanswered_via_cloud(cloud_client, hints_applied, test_structure_json
             })
             continue
 
-        # target_index не задан, но есть find_text — восстановление по тексту.
+        # target_index не задан — восстановление по тексту правильного варианта.
+        # Модель часто кладёт его не в find_text, а в params.value, answer, text
+        # или selected — подтягиваем как find_text перед сопоставлением.
+        if not ft:
+            ft = _norm(value or h.get("answer") or h.get("text")
+                       or h.get("selected") or "")
         if ft:
             idx = None
             for o in opts:
@@ -939,7 +986,8 @@ def answer_unanswered_via_cloud(cloud_client, hints_applied, test_structure_json
             log.warning("  Облако-2: Q%d не сопоставлен find_text=%r", qi, ft[:80])
             continue
 
-        log.warning("  Облако-2: Q%d hint без target_index/find_text — пропущен", qi)
+        log.warning("  Облако-2: Q%d hint без target_index/find_text — пропущен (raw=%s)",
+                    qi, str(h)[:200])
 
     log.info("Облако 2-й проход: %d hints → %d после валидации",
              len(new_hints), len(validated))
@@ -1000,6 +1048,17 @@ def _setup_clients(cfg: dict) -> dict:
 
     cdp = CDPClient(host=chrome_cfg.get("host", "localhost"),
                     port=chrome_cfg["debug_port"])
+
+    # Новая фича: cloud-запросы через fetch() браузера (CDP Runtime.evaluate),
+    # не через Python urllib. cdp подключается к вкладке внутри process_one_tab;
+    # тогда cloud.ask() шлёт POST через cdp.fetch_json(). Если вкладка пропала и
+    # cdp не подключён — клиент сам откатывается на urllib (cdp.fetch_json не
+    # вызовется). Атрибут ставим после создания cdp, т.к. cloud строится раньше.
+    if cloud is not None and hasattr(cloud, "cdp"):
+        cloud.cdp = cdp
+        logging.getLogger("usb_agent").info(
+            "Cloud-запросы: через fetch() браузера (CDP Runtime.evaluate), не urllib."
+        )
 
     return {
         "local": local,

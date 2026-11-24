@@ -23,12 +23,17 @@ from typing import Optional
 
 class OpenRouterClient:
     def __init__(self, api_key: str, model: str = "google/gemini-2.0-flash-exp:free",
-                 use_search: bool = True, timeout: int = 60, max_tokens: int = 8192):
+                 use_search: bool = True, timeout: int = 60, max_tokens: int = 8192,
+                 cdp=None):
         self.api_key = api_key
         self.model = model
         self.use_search = use_search
         self.timeout = timeout
         self.max_tokens = max_tokens
+        # Если задан cdp (CDPClient), ask() шлёт POST через fetch() браузера
+        # (cdp.fetch_json) — запрос идёт от имени подключённой вкладки. Иначе
+        # откатывается на urllib (Python).
+        self.cdp = cdp
 
     def ask(self, prompt: str, system: Optional[str] = None,
             temperature: Optional[float] = None) -> dict:
@@ -60,25 +65,44 @@ class OpenRouterClient:
         if self.use_search:
             body["plugins"] = [{"id": "web"}]
 
-        data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-                "HTTP-Referer": "https://github.com/usb-agent",
-                "X-OpenRouter-Title": "USB Agent",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenRouter HTTP {e.code}: {err[:400]}") from None
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"OpenRouter network error: {e.reason}") from None
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "HTTP-Referer": "https://github.com/usb-agent",
+            "X-OpenRouter-Title": "USB Agent",
+        }
+        if self.cdp is not None:
+            # Новая фича: запрос через fetch() браузера (CDP Runtime.evaluate),
+            # не через Python urllib. Идёт от имени подключённой вкладки тем же
+            # network stack / proxy / user-agent. CORS OpenRouter — '*' (проверено).
+            try:
+                res = self.cdp.fetch_json(url, headers, body,
+                                          timeout=self.timeout + 60)
+            except RuntimeError as e:
+                raise RuntimeError(f"OpenRouter fetch error: {e}") from None
+            if res["status"] != 200:
+                raise RuntimeError(
+                    f"OpenRouter HTTP {res['status']}: {res['body_text'][:400]}"
+                ) from None
+            try:
+                raw = json.loads(res["body_text"])
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"OpenRouter: не JSON ({e}): {res['body_text'][:300]}"
+                ) from None
+        else:
+            data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data, headers=headers, method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                err = e.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"OpenRouter HTTP {e.code}: {err[:400]}") from None
+            except urllib.error.URLError as e:
+                raise RuntimeError(f"OpenRouter network error: {e.reason}") from None
 
         # Извлекаем текст ответа.
         # Reasoning-модели (nemotron, deepseek-r1, qwen-reasoning) кладут

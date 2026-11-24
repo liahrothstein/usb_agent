@@ -81,35 +81,101 @@ class CDPClient:
         self._send("Runtime.enable")
         return True
 
-    def _send(self, method: str, params: Optional[dict] = None) -> dict:
+    def _send(self, method: str, params: Optional[dict] = None,
+              timeout: float = 15) -> dict:
         if self._ws is None:
             raise RuntimeError("CDP: не подключено")
         self._msg_id += 1
         msg = {"id": self._msg_id, "method": method}
         if params:
             msg["params"] = params
+        # Поднимаем socket-timeout под операцию: websocket создан с timeout=10
+        # в connect(), а fetch через Runtime.evaluate(awaitPromise) идёт 30-60с.
+        # Без этого recv() поднимает WebSocketTimeoutException на 10-й секунде и
+        # запрос обрывается задолго до реального таймаута (было: cloud падал с
+        # "Connection timed out" ровно через 10с).
+        try:
+            self._ws.settimeout(timeout)
+        except Exception:
+            pass
         self._ws.send(json.dumps(msg))
-        # Читаем, пока не получим ответ с нашим id (пропускаем события)
-        deadline = time.time() + 15
+        # Читаем, пока не получим ответ с нашим id (пропускаем события).
+        # WebSocketTimeoutException на recv — НЕ фатально: это socket-таймаут на
+        # одной попытке чтения, продолжаем ждать до общего deadline.
+        deadline = time.time() + timeout
         while time.time() < deadline:
-            raw = self._ws.recv()
+            try:
+                raw = self._ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
             if not raw:
                 continue
             data = json.loads(raw)
             if data.get("id") == self._msg_id:
                 return data
-        raise TimeoutError("CDP: нет ответа на " + method)
+        raise TimeoutError(f"CDP: нет ответа на {method} за {timeout}s")
 
     # --- high-level helpers ---
 
-    def evaluate(self, expression: str, return_by_value: bool = True) -> dict:
+    def evaluate(self, expression: str, return_by_value: bool = True,
+                 timeout: float = 15) -> dict:
         params = {
             "expression": expression,
             "returnByValue": return_by_value,
             "awaitPromise": True,
             "userGesture": True,
         }
-        return self._send("Runtime.evaluate", params)
+        return self._send("Runtime.evaluate", params, timeout=timeout)
+
+    def fetch_json(self, url: str, headers: dict, body: dict,
+                   timeout: float = 180) -> dict:
+        """POST JSON через fetch() браузера — в контексте подключённой вкладки,
+        через CDP Runtime.evaluate(awaitPromise). Запрос идёт от имени вкладки:
+        тем же network stack, proxy, user-agent, что и обычный браузерный трафик.
+        Возвращает {"status": int, "body_text": str}.
+
+        CORS: OpenRouter и llama-server (--cors-origins по умолчанию '*')
+        отдают Access-Control-Allow-Origin: *, так что cross-origin fetch из
+        вкладки проходит. timeout длиннее стандартного 15с — cloud-вызов
+        (nemotron + web-search) может идти 30-60с.
+        """
+        # body — JS-строка: json.dumps(body) даёт JSON-текст, второе
+        # json.dumps экранирует его как JS-строковый литерал для подстановки.
+        body_js = json.dumps(json.dumps(body, ensure_ascii=False))
+        headers_js = json.dumps(headers, ensure_ascii=False)
+        js = (
+            "(async () => {"
+            f"  const r = await fetch({json.dumps(url)}, {{"
+            "    method: 'POST',"
+            f"    headers: {headers_js},"
+            f"    body: {body_js}"
+            "  });"
+            "  const text = await r.text();"
+            "  return { status: r.status, body: text };"
+            "})()"
+        )
+        try:
+            result = self.evaluate(js, timeout=timeout)
+        except TimeoutError as e:
+            raise RuntimeError(
+                f"CDP fetch: нет ответа за {timeout}s ({e})") from None
+        except Exception as e:
+            # WebSocketTimeoutException / WebSocketConnectionClosedException и т.п.
+            # оборачиваем, чтобы cloud.ask выдал понятное "OpenRouter fetch error:",
+            # а не сырой "Connection timed out" без контекста.
+            raise RuntimeError(f"CDP fetch: {type(e).__name__}: {e}") from None
+        exc = result.get("result", {}).get("exceptionDetails")
+        if exc:
+            desc = exc.get("exception", {}).get("description", str(exc))[:400]
+            raise RuntimeError(f"CDP fetch JS-ошибка: {desc}")
+        try:
+            val = result["result"]["result"]["value"]
+            return {"status": int(val.get("status", 0)),
+                    "body_text": val.get("body", "")}
+        except (KeyError, TypeError, ValueError) as e:
+            raise RuntimeError(
+                f"CDP fetch: неожиданный ответ ({e}): {str(result)[:300]}"
+            )
 
     def get_page_text(self, max_chars: int = 10000) -> dict:
         """Возвращает url, title и обрезанный innerText активной вкладки."""
@@ -210,7 +276,17 @@ class CDPClient:
   const radioInputs = Array.from(document.querySelectorAll('input[type=radio], input[type=checkbox]'));
   // Текстовые поля — отдельные вопросы (если не внутри radio/checkbox блока)
   const TEXT_SEL = 'input[type=text], input[type=number], input[type=email], input[type=url], input[type=search], input[type=tel], textarea, input:not([type])';
-  const textInputs = Array.from(document.querySelectorAll(TEXT_SEL));
+  // readonly/disabled/hidden поля — НЕ ответные: это таймеры («Оставшееся
+  // время»), display-поля, служебные input'ы. Иначе метка таймера становилась
+  // ложным text-вопросом, и облако под forced-answer эхо-возвращало её же.
+  const textInputs = Array.from(document.querySelectorAll(TEXT_SEL)).filter(inp => {
+    if (inp.disabled || inp.readOnly) return false;
+    if (inp.type === 'hidden') return false;
+    if (inp.hidden || inp.getAttribute('aria-hidden') === 'true') return false;
+    const st = window.getComputedStyle(inp);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    return true;
+  });
 
   // Наименьший предок inp, содержащий >=2 input'ов того же типа = "блок вопроса".
   const findQuestionBlock = (inp) => {
@@ -412,6 +488,26 @@ class CDPClient:
   radioBlocks.forEach(b => units.push({ block: b, inputs: blockMap.get(b), qtype: blockMap.get(b)[0].type }));
   textUnits.forEach(u => units.push({ block: u.block, inputs: [u.inp], qtype: 'text' }));
 
+  // UI-метки (таймер «Оставшееся время» и т.п.) — не вопросы: text-input рядом
+  // с такой меткой не ответное поле. Поле может быть не readonly (JS обновляет
+  // таймер в обычном input), поэтому фильтруем по ТЕКСТУ вопроса, а не по
+  // атрибутам. До нумерации — индексы вопросов не съезжают. qText кэшируем,
+  // чтобы не считать повторно в цикле.
+  const UI_LABEL_PREFIXES = [
+    'оставшееся время', 'осталось времени', 'время до конца', 'до конца теста',
+    'таймер', 'time remaining', 'time left', 'remaining time', 'timer'
+  ];
+  const _nl = (s) => norm(s).toLowerCase();
+  for (let i = units.length - 1; i >= 0; i--) {
+    if (units[i].qtype !== 'text') continue;
+    const qt = findQuestionText(units[i].block);
+    if (UI_LABEL_PREFIXES.some(p => _nl(qt).startsWith(p))) {
+      units.splice(i, 1);
+    } else {
+      units[i]._qText = qt;
+    }
+  }
+
   // Сортировка в DOM-порядке — question_index идёт сверху вниз по странице
   units.sort((a, b) => {
     if (a.block === b.block) return 0;
@@ -431,7 +527,7 @@ class CDPClient:
     // apply_hint находит опцию по индексу внутри [data-usb-q="qIndex"] —
     // прямой доступ через data-usb-option-index, без текстового матчинга.
     block.dataset.usbQ = String(qIndex);
-    const qText = findQuestionText(block);
+    const qText = (unit._qText !== undefined) ? unit._qText : findQuestionText(block);
 
     if (type === 'text') {
       // Текстовый вопрос: вариантов нет, маркируем само поле для инжектора
