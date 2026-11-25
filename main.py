@@ -523,16 +523,20 @@ def deduplicate_hints(hints: list, test_structure_json: str) -> list:
                     _log.info("  Конвертирован placeholder→tint Q%d: index=%s",
                               qi, idx)
                     continue
-                # value не сопоставлен с вариантом — мигрируем на ближайший
-                # text-вопрос (текстовый ответ переносится; индекс — нет).
-                text_qi = next((i for i, qq in enumerate(questions, 1)
-                                if qq.get("type") == "text"), None)
-                if text_qi:
-                    _log.info("  Перемещён text-hint Q%d→Q%d", qi, text_qi)
-                    h["question_index"] = text_qi
-                    question_hints.setdefault(text_qi, []).append(h)
-                else:
-                    unmatched.append(h)
+                # value не сопоставлен с вариантом radio/checkbox-вопроса —
+                # LLM выдал текстовый ответ на вопрос с опциями (галлюцинация
+                # или спутанный question_index). РАНЬШЕ мигрировали на «первый
+                # text-вопрос» — это BLEED: чужой ответ (напр. «референдум» с
+                # radio-вопроса) залипал в первый shortanswer (Q41 получал ответ
+                # соседнего вопроса вместо фамилии командира). Перенос на «первый
+                # text-вопрос» никогда не попадал в целевой вопрос — text-вопросов
+                # много, угадать правильный по несовпавшему value невозможно.
+                # Правильно ДРОПАТЬ: вопрос остаётся без hint → 2-й cloud-проход
+                # переформулирует его корректно. Миграция убрана как deterministic
+                # bleed-вектор.
+                _log.info("  Q%d: placeholder_hint для radio/checkbox, value=%r "
+                          "не сопоставлен с опциями — дроп (без миграции, избегаем bleed)",
+                          qi, str(value)[:50])
                 continue
             unmatched.append(h)
             continue

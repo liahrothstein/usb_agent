@@ -271,15 +271,47 @@ class CDPClient:
   document.querySelectorAll('[data-usb-q]').forEach(el => delete el.dataset.usbQ);
   document.querySelectorAll('[data-usb-option-index]').forEach(el => delete el.dataset.usbOptionIndex);
   document.querySelectorAll('[data-usb-text-input]').forEach(el => delete el.dataset.usbTextInput);
+  // usbTinted ставится инъектором на opt/wrap после применения подсказки.
+  // Между прогонами на той же странице эти метки НЕ очищались → инъектор
+  // считал опции «уже подсвеченными» и молча пропускал (apply = 2/77).
+  // Стираем вместе с остальными маркерами.
+  document.querySelectorAll('[data-usb-tinted]').forEach(el => delete el.dataset.usbTinted);
 
   const results = [];
-  const radioInputs = Array.from(document.querySelectorAll('input[type=radio], input[type=checkbox]'));
+
+  // Scope к quiz-root: Moodle-форма квиза (#responseform) содержит только
+  // вопросы и ИСКЛЮЧАЕТ чат/настройки/навигацию (message-drawer, settings panel).
+  // Без этого чат-инпуты «Выбранные сообщения», настройки «Использовать Enter…»,
+  // radio «who can message you» и кнопки-labels плодили ложные вопросы (Q78–82),
+  // уходили во 2-й cloud-проход и засоряли UI placeholder'ами. Строковый матчинг
+  // таких меток хрупок (каждый сайт/LMS — свои); зато quiz-root отсекает ВСЁ
+  // chrome сразу. Порядок: Moodle-форма → общий предок всех .que → весь документ
+  // (fallback, сохраняет поведение на не-Moodle сайтах вроде C++-страницы).
+  const hasAnswerInput = (el) => el.querySelector(
+    'input[type=radio], input[type=checkbox], input[type=text], input[type=number], textarea');
+  const findQuizRoot = () => {
+    const f = document.querySelector('form#responseform, form[name="responseform"]');
+    if (f && hasAnswerInput(f)) return f;
+    const ques = document.querySelectorAll('.que');
+    if (ques.length >= 2) {
+      let anc = ques[0];
+      const last = ques[ques.length - 1];
+      while (anc && !anc.contains(last)) anc = anc.parentElement;
+      if (anc && hasAnswerInput(anc)) return anc;
+    } else if (ques.length === 1 && hasAnswerInput(ques[0])) {
+      return ques[0];
+    }
+    return document;
+  };
+  const quizRoot = findQuizRoot();
+
+  const radioInputs = Array.from(quizRoot.querySelectorAll('input[type=radio], input[type=checkbox]'));
   // Текстовые поля — отдельные вопросы (если не внутри radio/checkbox блока)
   const TEXT_SEL = 'input[type=text], input[type=number], input[type=email], input[type=url], input[type=search], input[type=tel], textarea, input:not([type])';
   // readonly/disabled/hidden поля — НЕ ответные: это таймеры («Оставшееся
   // время»), display-поля, служебные input'ы. Иначе метка таймера становилась
   // ложным text-вопросом, и облако под forced-answer эхо-возвращало её же.
-  const textInputs = Array.from(document.querySelectorAll(TEXT_SEL)).filter(inp => {
+  const textInputs = Array.from(quizRoot.querySelectorAll(TEXT_SEL)).filter(inp => {
     if (inp.disabled || inp.readOnly) return false;
     if (inp.type === 'hidden') return false;
     if (inp.hidden || inp.getAttribute('aria-hidden') === 'true') return false;
@@ -310,17 +342,48 @@ class CDPClient:
   });
   const radioBlocks = Array.from(blockMap.keys());
 
-  // Служебные надписи Moodle — не текст вопроса
-  const STOP_PHRASES = [
-    'Выберите', 'Select', 'Mark the', 'Ответ:', 'Текст вопроса',
-    'Question text', 'Укажите', 'Tick the'
-  ];
-  const isStopPhrase = (text) => {
-    const t = text.trim().toLowerCase();
-    if (t.length < 3 || t.length > 100) return false;
-    return STOP_PHRASES.some(p => t.startsWith(p.toLowerCase()));
-  };
   const norm = (s) => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  // className как строка (HTML) или baseVal (SVGAnimatedString) — единообразно.
+  const _cls = (el) => (typeof el.className === 'string')
+    ? el.className
+    : ((el.className && el.className.baseVal) || '');
+
+  // Screen-reader-only метки (Moodle .accesshide «Текст вопроса»/«Question text»,
+  // Bootstrap .sr-only, и др.) — СТРУКТУРНО скрытые, не видимый текст вопроса.
+  // Ловим по КЛАССУ обёртки, не по локали: accesshide|sr-only|visually-hidden|
+  // screen-reader[-text]|element-invisible|hide. Подтверждено исходником Moodle
+  // (renderer.php: <h4 class="accesshide">Текст вопроса</h4>) — класс стабилен,
+  // не переводится. Раньше ловили строками STOP_PHRASES («Текст вопроса»/
+  // «Question text»/«Выберите»...) — display-text hardcode, RU/EN-only. .qtext
+  // preference (структурный селектор ниже) берёт реальный текст вопроса; здесь
+  // лишь добиваем screen-reader-label. Границы [\s] чтобы не зацепить «clearfix».
+  const SR_ONLY_CLASS = /(?:^|[\s])(?:accesshide|sr-only|visually-hidden|visuallyhidden|screen-reader(?:-text)?|screenreader-text|element-invisible|hide)(?:[\s]|$)/i;
+  const isScreenReaderOnly = (el) => SR_ONLY_CLASS.test(_cls(el));
+
+  // СТРУКТУРНЫЙ сигнал reset-опции («Очистить мой выбор»/«Clear my choice»):
+  // radio сброса лежит в reset-обёртке. Подтверждено исходником Moodle
+  // (question/type/multichoice/renderer.php: wrapper class='qtype_multichoice_clearchoice',
+  // старый Moodle — qamc_clear; при отсутствии выбора добавляется sr-only +
+  // aria-hidden). Имена классов и data-* НЕ локализуются → универсальнее
+  // строкового списка. RESET_CLASS покрывает qtype_multichoice_clearchoice
+  // (через clear[_-]?choice с границей «_»), qamc_clear, reset/deselect/remove.
+  // Токены с границами [\s_-], чтобы НЕ зацепить layout-класс «clearfix»
+  // (иначе реальная опция в clearfix-обёртке дропнулась — проверено тестом).
+  const RESET_CLASS = /(?:^|[\s_-])(?:qamc[_-]?clear|clear[_-]?(?:choice|answer|selection)|reset[_-]?(?:choice|answer|selection|all)|deselect|remove[_-]?choice)(?:[\s_-]|$)/i;
+  const isClearChoiceInput = (inp) => {
+    let p = inp;
+    for (let i = 0; i < 3 && p; i++) {
+      if (RESET_CLASS.test(_cls(p))) return true;
+      if (p.getAttribute) {
+        const action = p.getAttribute('data-action') || '';
+        const region = p.getAttribute('data-region') || '';
+        if (/^(?:clear|reset|deselect|remove)/i.test(action)) return true;
+        if (/^(?:qamc_clear|clear[_-]?choice|reset|deselect)/i.test(region)) return true;
+      }
+      p = p.parentElement;
+    }
+    return false;
+  };
 
   // "Текст" элемента: textContent → img.alt → первый img[alt] внутри → title → aria-label
   const getElementText = (el) => {
@@ -452,8 +515,9 @@ class CDPClient:
         const els = searchRoot.querySelectorAll(sel);
         for (const el of els) {
           if (block.contains(el) || el.contains(block)) continue;
+          if (isScreenReaderOnly(el)) continue;          // .accesshide «Текст вопроса» и т.п.
           const text = norm(getElementRichText(el));
-          if (text.length > 10 && !isStopPhrase(text)) { qText = text; break; }
+          if (text.length > 10) { qText = text; break; }
         }
         if (qText) break;
       }
@@ -461,14 +525,15 @@ class CDPClient:
       for (const child of searchRoot.children) {
         if (child === block || child.contains(block) || block.contains(child)) continue;
         if (child.querySelector('input[type=radio], input[type=checkbox]')) continue;
+        if (isScreenReaderOnly(child)) continue;          // screen-reader label — не текст вопроса
         const text = norm(getElementRichText(child));
-        if (text.length > 15 && !isStopPhrase(text)) { qText = text; break; }
+        if (text.length > 15) { qText = text; break; }
       }
       if (qText) break;
     }
     if (!qText) {
       const legend = block.querySelector('legend');
-      if (legend) { const t = norm(getElementRichText(legend)); if (t && !isStopPhrase(t)) qText = t; }
+      if (legend && !isScreenReaderOnly(legend)) { const t = norm(getElementRichText(legend)); if (t) qText = t; }
     }
     if (qText.length > 600) qText = qText.substring(0, 600);
     return qText;
@@ -488,23 +553,29 @@ class CDPClient:
   radioBlocks.forEach(b => units.push({ block: b, inputs: blockMap.get(b), qtype: blockMap.get(b)[0].type }));
   textUnits.forEach(u => units.push({ block: u.block, inputs: [u.inp], qtype: 'text' }));
 
-  // UI-метки (таймер «Оставшееся время» и т.п.) — не вопросы: text-input рядом
-  // с такой меткой не ответное поле. Поле может быть не readonly (JS обновляет
-  // таймер в обычном input), поэтому фильтруем по ТЕКСТУ вопроса, а не по
-  // атрибутам. До нумерации — индексы вопросов не съезжают. qText кэшируем,
-  // чтобы не считать повторно в цикле.
-  const UI_LABEL_PREFIXES = [
-    'оставшееся время', 'осталось времени', 'время до конца', 'до конца теста',
-    'таймер', 'time remaining', 'time left', 'remaining time', 'timer'
-  ];
-  const _nl = (s) => norm(s).toLowerCase();
+  // Таймер/UI-метки у text-input'ов — НЕ ответные поля. Раньше ловили строками
+  // UI_LABEL_PREFIXES («оставшееся время»/«time remaining»...) — display-text
+  // hardcode, RU/EN-only. Структурно таймер исключается: (1) Moodle-таймер —
+  // <span role="timer">, не <input>, в textInputs не попадает; (2) readonly/
+  // disabled/hidden/aria-hidden/visibility-фильтр выше; (3) quizRoot исключает
+  // chrome (message-drawer, settings). Добиваем ARIA role=timer на самом input
+  // или ближайшем предке — locale-агностично, ловит LMS с input-таймером.
+  // qText кэшируем, чтобы не считать повторно в цикле ниже.
   for (let i = units.length - 1; i >= 0; i--) {
     if (units[i].qtype !== 'text') continue;
-    const qt = findQuestionText(units[i].block);
-    if (UI_LABEL_PREFIXES.some(p => _nl(qt).startsWith(p))) {
+    const inp = units[i].inp;
+    let isTimer = false;
+    if (inp) {
+      let p = inp;
+      for (let k = 0; k < 3 && p; k++) {
+        if (p.getAttribute && p.getAttribute('role') === 'timer') { isTimer = true; break; }
+        p = p.parentElement;
+      }
+    }
+    if (isTimer) {
       units.splice(i, 1);
     } else {
-      units[i]._qText = qt;
+      units[i]._qText = findQuestionText(units[i].block);
     }
   }
 
@@ -519,19 +590,17 @@ class CDPClient:
 
   let qIndex = 0;
   for (const unit of units) {
-    qIndex++;
     const block = unit.block;
     const inputs = unit.inputs;
     const type = unit.qtype;
-    // Реальный DOM-scope: помечаем КОНТЕЙНЕР вопроса (блок с опциями).
-    // apply_hint находит опцию по индексу внутри [data-usb-q="qIndex"] —
-    // прямой доступ через data-usb-option-index, без текстового матчинга.
-    block.dataset.usbQ = String(qIndex);
     const qText = (unit._qText !== undefined) ? unit._qText : findQuestionText(block);
 
     if (type === 'text') {
-      // Текстовый вопрос: вариантов нет, маркируем само поле для инжектора
+      // Текстовый вопрос (UI-метки отфильтрованы ранее): маркируем поле.
+      // qIndex инкрементируем здесь — спурных text-единиц нет.
       const inp = inputs[0];
+      qIndex++;
+      block.dataset.usbQ = String(qIndex);
       inp.dataset.usbQIndex = String(qIndex);
       inp.dataset.usbTextInput = '1';
       results.push({ question_index: qIndex, type: 'text', question_text: qText, options: [] });
@@ -539,31 +608,42 @@ class CDPClient:
     }
 
     // radio/checkbox: options + МАРКИРОВКА input и img.
-    // Индекс = позиция в массиве options (0-based). Проставляется на каждый
-    // input И связанный img как data-usb-option-index — apply_hint берёт
-    // элемент напрямую по индексу, без текстового матчинга.
+    // «Очистить мой выбор»/«Clear my choice» (Moodle) — служебный radio сброса,
+    // не ответ: фильтруем из options. Если после фильтра options пуст — блок
+    // состоял только из clear-радио (спурный дубль реального вопроса: плодит
+    // 148 вопросов из 80): пропускаем БЕЗ инкремента qIndex и без маркировки,
+    // индексы остаются сплошными и адресация apply_hint не съезжает.
+    // Маркировку input/img делаем ПОСЛЕ проверки на пустоту — иначе дропнутый
+    // блок оставил бы data-usb-q на контейнере и путал apply_hint.
     const options = [];
+    const kept = [];  // [{inp, idx, img}] — маркируем только если блок не дропнут
     let optIdx = 0;
     inputs.forEach(inp => {
       const optText = extractOptionText(inp, block);
-      if (optText && optText.trim()) {
-        const normOpt = norm(optText);
-        const idx = optIdx++;
-        options.push({ index: idx, text: normOpt });
-        inp.dataset.usbQIndex = String(qIndex);
-        inp.dataset.usbOptionIndex = String(idx);
-        // Если текст взят из alt — маркируем и саму картинку тем же индексом
-        const lbl = inp.closest('label') || inp.parentElement;
-        if (lbl) {
-          const img = lbl.tagName === 'IMG' ? lbl : lbl.querySelector('img[alt]');
-          if (img && img.alt && norm(img.alt) === normOpt) {
-            img.dataset.usbQIndex = String(qIndex);
-            img.dataset.usbOptionIndex = String(idx);
-          }
-        }
+      if (!optText || !optText.trim()) return;
+      if (isClearChoiceInput(inp)) return;   // структурный сигнал reset-обёртки (qtype_multichoice_clearchoice и др.)
+      const normOpt = norm(optText);
+      const idx = optIdx++;
+      options.push({ index: idx, text: normOpt });
+      const lbl = inp.closest('label') || inp.parentElement;
+      let img = null;
+      if (lbl) {
+        img = lbl.tagName === 'IMG' ? lbl : lbl.querySelector('img[alt]');
+        if (img && (!img.alt || norm(img.alt) !== normOpt)) img = null;
+      }
+      kept.push({ inp, idx, img });
+    });
+    if (options.length === 0) continue;  // спурный clear-блок — пропускаем
+    qIndex++;
+    block.dataset.usbQ = String(qIndex);
+    kept.forEach(({ inp, idx, img }) => {
+      inp.dataset.usbQIndex = String(qIndex);
+      inp.dataset.usbOptionIndex = String(idx);
+      if (img) {
+        img.dataset.usbQIndex = String(qIndex);
+        img.dataset.usbOptionIndex = String(idx);
       }
     });
-
     results.push({
       question_index: qIndex,
       type: type,
@@ -593,18 +673,22 @@ class CDPClient:
             _log.warning("get_test_structure упал: %s", e)
             return "[]"
 
-    def inject_script(self, script: str) -> bool:
+    def inject_script(self, script: str):
+        """Выполняет JS и возвращает его return-value (строка-код / bool / None).
+        Инъектор возвращает коды: 'ok' / 'no_container' /
+        'no_option:have=N,idx=[..],want=M' / 'tinted_opt' / 'tinted_wrap' /
+        'no_input' / 'not_found' — точная причина неудачи apply вместо
+        молчаливого false. Раньше возвращалось `value is True`, что теряло
+        различие между «нет контейнера», «нет опции» и «уже тонировано»."""
         result = self.evaluate(script)
         exc = result.get("result", {}).get("exceptionDetails")
         if exc is not None:
-            return False
-        # Скрипт возвращает true, если элемент найден и изменён;
-        # false — если querySelector не нашёл селектор. Проверяем значение,
-        # а не только отсутствие исключения — иначе счётчик «применено» врёт.
+            desc = exc.get("exception", {}).get("description", str(exc))[:160]
+            return "exception:" + desc
         try:
-            return result["result"]["result"]["value"] is True
+            return result["result"]["result"]["value"]
         except (KeyError, TypeError):
-            return False
+            return None
 
     def close(self):
         if self._ws:

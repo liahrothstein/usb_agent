@@ -61,7 +61,8 @@ def apply_hints(cdp, hints: List[Dict]) -> int:
         if not script:
             _log.info("  пропуск: action=%s params=%r (не построен)", action, params)
             continue
-        ok = cdp.inject_script(script)
+        ret = cdp.inject_script(script)
+        ok = (ret == "ok")
         if is_text_hint:
             desc = f"placeholder={params.get('value','')!r}"
         elif is_tint_hint:
@@ -72,7 +73,9 @@ def apply_hints(cdp, hints: List[Dict]) -> int:
             desc = f"selector={selector}"
         if question_index:
             desc += f" Q{question_index}"
-        status = "OK" if ok else "НЕ найден/не применён"
+        # ret — точная причина: 'ok' / 'no_container' / 'no_option:have=N,idx=[..]' /
+        # 'tinted_opt' / 'tinted_wrap' / 'no_input' / 'not_found' / 'exception:...'
+        status = "OK" if ok else f"НЕ найден ({ret})"
         _log.info("  %s | %s action=%s params=%r", status, desc, action, params)
         if ok:
             applied += 1
@@ -102,14 +105,14 @@ def _build_script(selector: str, action: str, params: Dict,
             "  for (const el of marked) {\n"
             "    if (el.dataset.usbQIndex !== String(qIndex)) continue;\n"
             "    if (el.dataset.usbTextInput !== '1') continue;\n"
-            "    if (el.dataset.usbTinted === '1') return false;\n"
+            "    if (el.dataset.usbTinted === '1') return 'tinted_input';\n"
             "    try {\n"
             f"      {body}\n"
             "      el.dataset.usbTinted = '1';\n"
-            "      return true;\n"
-            "    } catch (e) { return false; }\n"
+            "      return 'ok';\n"
+            "    } catch (e) { return 'error:' + e.message; }\n"
             "  }\n"
-            "  return false;\n"
+            "  return 'no_input';\n"
             "})()"
         )
 
@@ -124,10 +127,14 @@ def _build_script(selector: str, action: str, params: Dict,
             f"  const qIndex = {int(question_index)};\n"
             f"  const targetIdx = {int(target_index)};\n"
             "  const qContainer = document.querySelector('[data-usb-q=\"' + qIndex + '\"]');\n"
-            "  if (!qContainer) return false;\n"
+            "  if (!qContainer) return 'no_container';\n"
             "  const opt = qContainer.querySelector('[data-usb-option-index=\"' + targetIdx + '\"]');\n"
-            "  if (!opt) return false;\n"
-            "  if (opt.dataset.usbTinted === '1') return false;\n"
+            "  if (!opt) {\n"
+            "    const idxs = Array.from(qContainer.querySelectorAll('[data-usb-option-index]'))\n"
+            "      .map(e => e.dataset.usbOptionIndex);\n"
+            "    return 'no_option:have=' + idxs.length + ',idx=[' + idxs.join(',') + '],want=' + targetIdx;\n"
+            "  }\n"
+            "  if (opt.dataset.usbTinted === '1') return 'tinted_opt';\n"
             "  // Обёртка: label, либо ближайший предок без других input'ов.\n"
             "  // Если opt — img, обёртка = label или родитель.\n"
             "  let wrap = null;\n"
@@ -146,13 +153,15 @@ def _build_script(selector: str, action: str, params: Dict,
             "    }\n"
             "  }\n"
             "  if (!wrap) wrap = opt;\n"
-            "  if (wrap.dataset.usbTinted === '1') return false;\n"
+            "  if (wrap.dataset.usbTinted === '1')\n"
+            "    return 'tinted_wrap:tag=' + wrap.tagName + ',cls=' + (wrap.className || '').slice(0,40);\n"
             "  const el = wrap;\n"
             "  try {\n"
             f"    {body}\n"
             "    wrap.dataset.usbTinted = '1';\n"
-            "    return true;\n"
-            "  } catch (e) { return false; }\n"
+            "    opt.dataset.usbTinted = '1';\n"
+            "    return 'ok';\n"
+            "  } catch (e) { return 'error:' + e.message; }\n"
             "})()"
         )
 
@@ -171,8 +180,8 @@ def _build_script(selector: str, action: str, params: Dict,
             "      try {\n"
             f"        {body}\n"
             "        img.dataset.usbTinted = '1';\n"
-            "        return true;\n"
-            "      } catch (e) { return false; }\n"
+            "        return 'ok';\n"
+            "      } catch (e) { return 'error:' + e.message; }\n"
             "    }\n"
             "  }\n"
             "  const els = document.querySelectorAll('label,span,td,li,p,a,option,strong,em,code,pre,h1,h2,h3,h4');\n"
@@ -183,11 +192,11 @@ def _build_script(selector: str, action: str, params: Dict,
             "      try {\n"
             f"        {body}\n"
             "        el.dataset.usbTinted = '1';\n"
-            "        return true;\n"
-            "      } catch (e) { return false; }\n"
+            "        return 'ok';\n"
+            "      } catch (e) { return 'error:' + e.message; }\n"
             "    }\n"
             "  }\n"
-            "  return false;\n"
+            "  return 'not_found';\n"
             "})()"
         )
     if not selector:
@@ -195,12 +204,12 @@ def _build_script(selector: str, action: str, params: Dict,
     return (
         "(() => {\n"
         f"  const el = document.querySelector({_js_str(selector)});\n"
-        "  if (!el) return false;\n"
+        "  if (!el) return 'not_found';\n"
         "  try {\n"
         f"    {body}\n"
-        "    return true;\n"
+        "    return 'ok';\n"
         "  } catch (e) {\n"
-        "    return false;\n"
+        "    return 'error:' + e.message;\n"
         "  }\n"
         "})()"
     )
